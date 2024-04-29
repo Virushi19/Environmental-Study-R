@@ -1,0 +1,645 @@
+---
+title: "MA 589 Final Project"
+author: "Group Member: Liyu Qu, Yumeng Cao, Virushi Patel, Jingyi Li"
+date: "2024-04-26"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Cluster on a Gaussian mixture model using the EM-algorithm
+# Contents
+1. [Load Packages](#Load-packages)
+2. [Preprocess the data](#Read and preprocess the data)
+3. [Principal Component Analysis (PCA)](#use Principal Component Analysis (PCA) to find the most important two factors)
+4. [(1) 6-component GMM clustering using Key Features in PC1](#(1) GMM Clustering with Key Features (AirQualityIndex & AverageTemperature) in PC1)
+   - [Define the EM update function](#EM update function)
+   - [Function to Compute the Calinski-Harabasz Index](#Function to Compute the Calinski-Harabasz Index for Clustering Evaluation)
+   - [Identify the optimal number of clusters](#Initial Parameters & Identify the optimal number of clusters (here=6))
+   - [Return the Calinski-Harabasz Indices](#Print the Calinski-Harabasz Indices)
+   - [EM Iterations for Optimal Cluster Number (n = 6)](#EM Iterations for Optimal Cluster Number (here = 6))
+   - [Return cluster results](#Output cluster results)
+   - [Count samples in each cluster](#Count samples in each cluster)
+   - [Return feature contributions to clustering](#Compute feature contributions to clustering)
+   - [Return the denormalized means for each cluster](#Get the denormalized means for each cluster)
+   - [Visualize the clustering results](#Visualize the clustering results)
+   
+5. [(2) 3-component GMM clustering using Key Features in PC2](#GMM Clustering with Key Features (AnnualRainfall & ForestAreaPercentage) in PC2)
+   - [Identify the optimal number of clusters](#Initial Parameters & Identify the optimal number of clusters (here=3))
+   - [Return the Calinski-Harabasz Indices](#Print the Calinski-Harabasz Indices)
+   - [EM Iterations for Optimal Cluster Number (n = 3)](EM Iterations for Optimal Cluster Number (here = 3))
+   - [Return cluster results](#Output cluster results)
+   - [Count samples in each cluster](#Count samples in each cluster)
+   - [Return feature contributions to clustering](#Compute feature contributions to clustering)
+   - [Return the denormalized means for each cluster](#Get the denormalized means for each cluster)
+   - [Visualize the clustering results](#Visualize the clustering results)
+   
+## Load packages
+```{r}
+library(dplyr)
+library(caret)
+library(clue)
+library(cluster)
+library(fpc)
+library(tidyr)
+library(ggplot2)
+```
+
+## Read and preprocess the data
+```{r, fig.width=10, fig.height=10}
+data <- read.csv("data/Environmental_Study_11_23.csv")
+
+# Summary of the dataset
+summary(data)
+
+# Checking for missing values (No Missing-Values here)
+sum(is.na(data))
+
+# Quick exploratory visualization
+pairs(data[, c('AverageTemperature', 'AnnualRainfall', 'AirQualityIndex', 'ForestAreaPercentage')],
+      main = "Pairwise Scatterplot of Features",
+      pch = 21, bg = c("red", "green", "blue", "yellow")[data$cluster])
+
+# Boxplots for a visual summary of each feature
+par(mfrow=c(2,2))  # arranging plots in 2 rows and 2 columns
+boxplot(data$AverageTemperature, main="Average Temperature")
+boxplot(data$AnnualRainfall, main="Annual Rainfall")
+boxplot(data$AirQualityIndex, main="Air Quality Index")
+boxplot(data$ForestAreaPercentage, main="Forest Area Percentage")
+
+# available features
+features <- data[, c('AverageTemperature', 'AnnualRainfall', 'AirQualityIndex', 'ForestAreaPercentage')]
+
+# centering and scaling available features
+preproc <- preProcess(features, method = c("center", "scale"))
+features_scaled <- predict(preproc, newdata = features)
+```
+
+
+## use Principal Component Analysis (PCA) to find the most important two factors
+```{r}
+# Perform PCA on the scaled features
+pca_result <- prcomp(features_scaled)
+summary(pca_result)
+
+# Extract the loadings of the first two principal components
+# represent the contribution of each scaled feature to the first two principal components
+important_features <- pca_result$rotation[, 1:2]
+important_features
+```
+```{r}
+important_features <- data.frame(
+  Feature = c("AverageTemperature", "AnnualRainfall", "AirQualityIndex", "ForestAreaPercentage"),
+  PC1 = c(-0.6725639, -0.2656894, -0.6779748, 0.1319737),
+  PC2 = c(0.15377620, -0.59852875, -0.07041969, -0.78304361)
+)
+
+important_features$PC1 <- abs(important_features$PC1)
+important_features$PC2 <- abs(important_features$PC2)
+
+important_features_long <- pivot_longer(important_features, cols = c("PC1", "PC2"), names_to = "PC", values_to = "Value")
+
+
+ggplot(important_features_long, aes(x = Feature, y = Value, fill = PC)) +
+  geom_bar(stat = "identity", position = position_dodge(), width = 0.7) +  
+  
+  labs(title = "Absolute Loadings of Features on PC1 and PC2",
+       x = "Feature",
+       y = "Absolute Loading") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Pastel1", name = "Principal Component")  
+
+```
+
+
+**As PC1 and PC2 accounting for approximately 52.93% of the variance, these two components capture a significant portion of the information in the data. PC1 is strongly influenced by AirQualityIndex and AverageTemperature. And PC2 shows significant negative loadings for ForestAreaPercentage and AnnualRainfall, indicating their strong inverse relationship with the second principal component.**
+
+
+# (1) GMM Clustering with Key Features (AirQualityIndex & AverageTemperature) in PC1
+```{r}
+# Key Features (AirQualityIndex & AverageTemperature) in PC1
+features <- data[, c( 'AirQualityIndex', 'AverageTemperature')]
+
+# centering and scaling available features
+preproc <- preProcess(features, method = c("center", "scale"))
+features_scaled <- predict(preproc, newdata = features)
+```
+
+## EM update function
+```{r}
+
+# Log-density of multivariate normal distribution
+ldmvnorm <- function (x, mu, C) {
+  v <- backsolve(C, x - mu, transpose = TRUE)
+  -sum(log(diag(C))) - 0.5 * sum(v * v)
+}
+
+# EM update function
+em_update <- function(x, em, t, ll_prev) {
+  ll <- qlogis(em$lambda)
+  f <- sapply(1:t, function(k) apply(x, 1, ldmvnorm, em$mu[[k]], chol(em$sigma[[k]])))
+  # Use softmax instead of plogis
+  f <- f + ll
+  max_f <- apply(f, 1, max)
+  p <- exp(f - max_f)
+  p <- sweep(p, 1, rowSums(p), FUN="/") # Normalize to get probabilities
+  # E[Z_i | X_i; theta_t]
+  Q_new <- sum(p * (f - log(p)))
+  if (is.na(Q_new)) {
+    Q <- ll_prev
+  } else {
+    Q <- Q_new
+  }
+  # M-step
+  em$lambda <- colMeans(p)
+  for(k in 1:t) {
+    em$mu[[k]] <- apply(x, 2, weighted.mean, w = p[, k])
+    em$sigma[[k]] <- cov.wt(x, wt = p[, k], center = em$mu[[k]], method = "ML")$cov
+  }
+  list(params = em, responsibilities = p, Q=Q)
+}
+```
+
+## Function to Compute the Calinski-Harabasz Index for Clustering Evaluation
+```{r}
+calculate_ch_index <- function(data, clusters) {
+  clus_stats <- calinhara(data, clusters)
+  return(clus_stats)
+}
+```
+
+## Initial Parameters & Identify the optimal number of clusters (here=6)
+```{r}
+t_range <- 2:8   # Range of cluster numbers to evaluate
+ch_indices <- numeric(length(t_range)) # Initialize Calinski-Harabasz index array
+names(ch_indices) <- as.character(t_range) 
+ 
+for (t in t_range) {
+  set.seed(259)
+  max_iter <- 10000 # Maximum number of iterations
+  tolerance <- 1e-6 # Convergence threshold
+  converged <- FALSE # Convergence flag
+  log_likelihood_prev <- -Inf # Initialize Log-likelihood
+  
+  features_scaled <- predict(preproc, newdata = features) # centering and scaling features
+  init_mu <- lapply(1:t, function(i) colMeans(features_scaled) + rnorm(ncol(features_scaled)))
+  init_sigma <- lapply(1:t, function(i) diag(runif(ncol(features_scaled))))
+  init_lambda <- rep(1/t, t)
+  # Group initial parameters in a list
+  em_params <- list(mu = init_mu, sigma = init_sigma, lambda = init_lambda)
+  
+  # EM iterations
+  for (iter in 1:max_iter) {
+    em_result <- em_update(as.matrix(features_scaled), em_params, t,log_likelihood_prev)
+
+    if (abs(em_result$Q - log_likelihood_prev) < tolerance) {
+      break
+    }
+    em_params <- em_result$params # Update parameters
+    log_likelihood_prev <- em_result$Q # Update loglikelihood
+  }
+  
+  # Calculate the CH index for the current number of clusters
+  cluster_assignments <- apply(em_result$responsibilities, 1, which.max)
+  ch_indices[as.character(t)] <- calculate_ch_index(features_scaled, cluster_assignments)
+  
+  # Print the number of iterations executed
+  cat(iter,"\n")
+}
+
+# Identify the optimal number of clusters based on the highest CH index
+best_t <- names(which.max(ch_indices))
+print(paste("Best number of clusters based on CH index:", best_t))
+```
+
+## Print the Calinski-Harabasz Indices
+```{r}
+#clusters of 6 has the highest CH index
+ch_indices
+```
+
+## Plot the CH indices
+```{r}
+ch_indices_data <- data.frame(
+  t = 2:8,
+  CH_Index = ch_indices
+)
+ggplot(ch_indices_data, aes(x = t, y = CH_Index)) +
+  geom_line(group = 1, color = "blue") +  
+  geom_point(aes(color = factor(t)), size = 3) +  
+  labs(title = "CH Index across Different Cluster Numbers for PC1",
+       x = "Number of Clusters",
+       y = "CH Index") +
+  theme_minimal() +
+  scale_color_discrete(name = "Cluster Number")  
+
+```
+
+## EM Iterations for Optimal Cluster Number (here = 6)
+```{r}
+t_range <- as.numeric(best_t)
+ch_indices <- numeric(length(t_range))
+names(ch_indices) <- as.character(t_range)
+
+for (t in t_range) {
+  set.seed(123)
+  max_iter <- 1000 # Maximum number of iterations
+  tolerance <- 1e-6 # Convergence threshold
+  converged <- FALSE # Convergence flag
+  log_likelihood_prev <- -Inf # Initialize Log-likelihood
+  
+  features_scaled <- predict(preproc, newdata = features)
+  init_mu <- lapply(1:t, function(i) colMeans(features_scaled) + rnorm(ncol(features_scaled)))
+  init_sigma <- lapply(1:t, function(i) diag(runif(ncol(features_scaled))))
+  init_lambda <- rep(1/t, t)
+  # Group initial parameters in a list
+  em_params <- list(mu = init_mu, sigma = init_sigma, lambda = init_lambda)
+  
+  # EM iterations
+  for (iter in 1:max_iter) {
+    em_result <- em_update(as.matrix(features_scaled), em_params, t)
+
+    if (abs(em_result$Q - log_likelihood_prev) < tolerance) {
+      break
+    }
+    
+    em_params <- em_result$params # Update parameters
+    log_likelihood_prev <- em_result$Q # Update loglikelihood
+  }
+
+  # Calculate the CH index for the current number of clusters
+  cluster_assignments <- apply(em_result$responsibilities, 1, which.max)
+  ch_indices[as.character(t)] <- calculate_ch_index(features_scaled, cluster_assignments)
+  
+  # Print the number of iterations executed
+  cat(iter,"\n")
+}
+```
+
+## Output cluster results
+```{r, fig.width=10, fig.height=10}
+## Extract final parameters
+# Collection of all parameters including mu, sigma, and lambda
+final_params <- em_result$params
+# List of mean vectors for each cluster
+final_means <- lapply(final_params$mu, function(mu) mu)
+# List of covariance matrices for each cluster
+final_covariances <- lapply(final_params$sigma, function(sigma) sigma)
+# Mixing weights for each Gaussian component (here = 6)
+final_lambdas <- final_params$lambda
+# Probabilities of each data point belonging to each cluster
+final_responsibilities <- em_result$responsibilities 
+
+## Output final results
+print("Final means of Gaussian distributions:")
+print(final_means)
+print("Final covariance matrices of Gaussian distributions:")
+print(final_covariances)
+print("Final mixing weights:")
+print(final_lambdas)
+
+# Assign each sample to the most likely Gaussian distribution
+data$cluster <- apply(final_responsibilities, 1, which.max)
+table(data$cluster, useNA = "always")
+```
+
+## Count samples in each cluster
+```{r}
+# Assign each data point to the most likely cluster based on the highest responsibility
+cluster_assignments <- apply(em_result$responsibilities, 1, which.max)
+cluster_counts <- table(cluster_assignments)
+print(cluster_counts)
+```
+```{r}
+cluster_data <- data.frame(
+  Cluster = c(1,2,3,4,5,6),
+  Count = c(52, 56, 45, 57, 58, 59)
+)
+
+ggplot(cluster_data, aes(x = Cluster, y = Count, fill = Cluster)) +
+  geom_bar(stat = "identity", color = "black", width = 0.7) + 
+  labs(title = "Count of Data Points in Each Cluster for PC1",
+       x = "Cluster Number",
+       y = "Count of Points") +
+  theme_minimal() 
+
+```
+## Compute feature contributions to clustering
+```{r}
+# Calculate the contribution of each feature to the clustering 
+# by comparing the variance within clusters to the overall variance
+# For each feature, calculate the sum of the within-cluster variance multiplied 
+# by cluster size minus one, then divide by the total variance of the feature
+features_contrib <- apply(features_scaled, 2, function(feature) {
+  sum(tapply(feature, cluster_assignments, var) * (table(cluster_assignments) - 1)) / var(feature)
+})
+
+# Sort contributions in decreasing order to identify which features most influence the clustering
+features_contrib_sorted <- sort(features_contrib, decreasing = TRUE)
+print(features_contrib_sorted)
+```
+
+## Get the denormalized means for each cluster
+```{r}
+# denormalize function
+denormalize <- function(x, mean, std){
+  std*x + mean
+}
+
+## Convert the normalized means back to their original scale
+denormalized_means <- list() # Initialize a list
+for (i in 1:6) {
+  denormalized_means[[i]] <- denormalize(em_result$params$mu[[i]], preproc$mean, preproc$std)
+}
+# Print the denormalized means
+print(denormalized_means)
+```
+
+## Visualize the clustering results
+```{r, fig.width=10, fig.height=10}
+ellipse <- function (mu, sigma, alpha, ns = 100) {
+  t <- seq(0, 2 * pi, length.out = ns) # param (angle)
+  p <- cbind(cos(t), sin(t))
+  e <- eigen(sigma)
+  s <- sqrt(e$values * qchisq(alpha, 2))
+  sweep(p, 2, s, `*`) |> tcrossprod(e$vectors) |> # scale
+    sweep(2, mu, `+`) # re-center
+}
+
+plot_em <- function (x, em, feature_indices, cluster_assignments, t, alpha_levels = c(.25, .5, .75, .95)) {
+  colors <- c("blue", "red", "green", "purple","black","yellow")  # Colors for each cluster
+  plot(x[, feature_indices], pch = 19, col = "gray", xlab = names(x)[feature_indices[1]], ylab = names(x)[feature_indices[2]])
+  
+  for (k in 1:t) {
+    cluster_points <- x[cluster_assignments == k, feature_indices]
+    points(cluster_points, pch = 19, col = colors[k])
+    
+    mu <- em$mu[[k]][feature_indices]
+    sigma <- em$sigma[[k]][feature_indices, feature_indices]
+    
+    for (alpha in alpha_levels) {
+      lines(ellipse(mu, sigma, alpha), col = colors[k])
+    }
+  }
+  
+  legend("topright", legend = 1:t, col = colors, pch = 19, title = "Clusters")
+}
+
+
+features <- data[, c( 'AirQualityIndex', 'AverageTemperature')]
+
+# Generate plots for each pair of features
+# Here only for AirQualityIndex v.s. AverageTemperature as we only used two features
+for (i in 1:(length(features) - 1)) {
+  for (j in (i + 1):length(features)) {
+    feature_indices <- c(i, j)
+    plot_em(features_scaled, em_result$params, feature_indices, cluster_assignments, t_range)
+  }
+}
+```
+
+# (2) GMM Clustering with Key Features (AnnualRainfall & ForestAreaPercentage) in PC2
+```{r}
+# Key Features (AnnualRainfall & ForestAreaPercentage) in PC2
+features <- data[, c( 'AnnualRainfall', 'ForestAreaPercentage')]
+
+# Re-scale data
+preproc <- preProcess(features, method = c("center", "scale"))
+features_scaled <- predict(preproc, newdata = features)
+```
+
+
+## Initial Parameters & Identify the optimal number of clusters (here=3)
+```{r}
+t_range <- 2:8
+ch_indices <- numeric(length(t_range))
+names(ch_indices) <- as.character(t_range)
+
+for (t in t_range) {
+  set.seed(259)
+  max_iter <- 10000 # Maximum number of iterations
+  tolerance <- 1e-6 # Convergence threshold
+  converged <- FALSE # Convergence flag
+  log_likelihood_prev <- -Inf # Initialize Log-likelihood
+  
+  features_scaled <- predict(preproc, newdata = features)
+  init_mu <- lapply(1:t, function(i) colMeans(features_scaled) + rnorm(ncol(features_scaled)))
+  init_sigma <- lapply(1:t, function(i) diag(runif(ncol(features_scaled))))
+  init_lambda <- rep(1/t, t)
+  # Group initial parameters in a list
+  em_params <- list(mu = init_mu, sigma = init_sigma, lambda = init_lambda)
+  
+  # EM iterations
+  for (iter in 1:max_iter) {
+    em_result <- em_update(as.matrix(features_scaled), em_params, t,log_likelihood_prev)
+
+    if (abs(em_result$Q - log_likelihood_prev) < tolerance) {
+      break
+    }
+    em_params <- em_result$params # Update parameters
+    log_likelihood_prev <- em_result$Q # Update loglikelihood
+  }
+
+  # Calculate the CH index for the current number of clusters
+  cluster_assignments <- apply(em_result$responsibilities, 1, which.max)
+  ch_indices[as.character(t)] <- calculate_ch_index(features_scaled, cluster_assignments)
+  
+  # Print the number of iterations executed
+  cat(iter,"\n")
+}
+
+# Identify the optimal number of clusters based on the highest CH index
+best_t <- names(which.max(ch_indices))
+print(paste("Best number of clusters based on CH index:", best_t))
+```
+
+## Print the Calinski-Harabasz Indices
+```{r}
+#clusters of 6 has the highest CH index
+ch_indices
+```
+
+```{r}
+ch_indices_data <- data.frame(
+  t = 2:8,
+  CH_Index = ch_indices
+)
+ggplot(ch_indices_data, aes(x = t, y = CH_Index)) +
+  geom_line(group = 1, color = "blue") +  
+  geom_point(aes(color = factor(t)), size = 3) +  
+  labs(title = "CH Index across Different Cluster Numbers for PC2",
+       x = "Number of Clusters",
+       y = "CH Index") +
+  theme_minimal() +
+  scale_color_discrete(name = "Cluster Number")  
+
+```
+
+## EM Iterations for Optimal Cluster Number (here = 3)
+```{r}
+t_range <- as.numeric(best_t)
+ch_indices <- numeric(length(t_range))
+names(ch_indices) <- as.character(t_range)
+
+for (t in t_range) {
+  set.seed(123)
+  max_iter <- 1000 # Maximum number of iterations
+  tolerance <- 1e-6 # Convergence threshold
+  converged <- FALSE # Convergence flag
+  log_likelihood_prev <- -Inf # Initialize Log-likelihood
+  
+  features_scaled <- predict(preproc, newdata = features)
+  init_mu <- lapply(1:t, function(i) colMeans(features_scaled) + rnorm(ncol(features_scaled)))
+  init_sigma <- lapply(1:t, function(i) diag(runif(ncol(features_scaled))))
+  init_lambda <- rep(1/t, t)
+  # Group initial parameters in a list
+  em_params <- list(mu = init_mu, sigma = init_sigma, lambda = init_lambda)
+
+  # EM iterations
+  for (iter in 1:max_iter) {
+    em_result <- em_update(as.matrix(features_scaled), em_params, t)
+
+    if (abs(em_result$Q - log_likelihood_prev) < tolerance) {
+      break
+    }
+    em_params <- em_result$params # Update parameters
+    log_likelihood_prev <- em_result$Q # Update loglikelihood
+  }
+
+  # Calculate the CH index for the current number of clusters
+  cluster_assignments <- apply(em_result$responsibilities, 1, which.max)
+  ch_indices[as.character(t)] <- calculate_ch_index(features_scaled, cluster_assignments)
+  
+  # Print the number of iterations executed
+  cat(iter,"\n")
+}
+```
+
+## Output cluster results
+```{r}
+## Extract final parameters
+# Collection of all parameters including mu, sigma, and lambda
+final_params <- em_result$params
+# List of mean vectors for each cluster
+final_means <- lapply(final_params$mu, function(mu) mu)
+# List of covariance matrices for each cluster
+final_covariances <- lapply(final_params$sigma, function(sigma) sigma)
+# Mixing weights for each Gaussian component (here = 6)
+final_lambdas <- final_params$lambda
+# Probabilities of each data point belonging to each cluster
+final_responsibilities <- em_result$responsibilities 
+
+## Output final results
+print("Final means of Gaussian distributions:")
+print(final_means)
+print("Final covariance matrices of Gaussian distributions:")
+print(final_covariances)
+print("Final mixing weights:")
+print(final_lambdas)
+
+# Assign each sample to the most likely Gaussian distribution
+data$cluster <- apply(final_responsibilities, 1, which.max)
+table(data$cluster, useNA = "always")
+```
+
+## Count samples in each cluster
+```{r}
+# Assign each data point to the most likely cluster based on the highest responsibility
+cluster_assignments <- apply(em_result$responsibilities, 1, which.max)
+cluster_counts <- table(cluster_assignments)
+print(cluster_counts)
+```
+
+```{r}
+cluster_data <- data.frame(
+  Cluster = c(1, 2, 3),
+  Count = c(112, 103, 112)
+)
+
+ggplot(cluster_data, aes(x = factor(Cluster), y = Count, fill = factor(Cluster))) +
+  geom_bar(stat = "identity", color = "black", width = 0.3) + 
+  labs(title = "Count of Data Points in Each Cluster for PC1",
+       x = "Cluster Number",
+       y = "Count of Points") +
+  theme_minimal() +
+  scale_x_discrete(name = "Cluster Number", labels = c("1", "2", "3"))
+
+```
+
+## Compute feature contributions to clustering
+```{r}
+# Calculate the contribution of each feature to the clustering 
+# by comparing the variance within clusters to the overall variance
+# For each feature, calculate the sum of the within-cluster variance multiplied 
+# by cluster size minus one, then divide by the total variance of the feature
+features_contrib <- apply(features_scaled, 2, function(feature) {
+  sum(tapply(feature, cluster_assignments, var) * (table(cluster_assignments) - 1)) / var(feature)
+})
+
+# Sort contributions in decreasing order to identify which features most influence the clustering
+features_contrib_sorted <- sort(features_contrib, decreasing = TRUE)
+print(features_contrib_sorted)
+```
+
+## Get the denormalized means for each cluster
+```{r}
+# denormalize function
+denormalize <- function(x, mean, std){
+  std*x + mean
+}
+
+## Convert the normalized means back to their original scale
+denormalized_means <- list() # Initialize a list
+for (i in 1:3) {
+  denormalized_means[[i]] <- denormalize(em_result$params$mu[[i]], preproc$mean, preproc$std)
+}
+# Print the denormalized means
+print(denormalized_means)
+```
+
+
+## Visualize the clustering results
+```{r, fig.width=10, fig.height=10}
+ellipse <- function (mu, sigma, alpha, ns = 100) {
+  t <- seq(0, 2 * pi, length.out = ns) # param (angle)
+  p <- cbind(cos(t), sin(t))
+  e <- eigen(sigma)
+  s <- sqrt(e$values * qchisq(alpha, 2))
+  sweep(p, 2, s, `*`) |> tcrossprod(e$vectors) |> # scale
+    sweep(2, mu, `+`) # re-center
+}
+
+plot_em <- function (x, em, feature_indices, cluster_assignments, t, alpha_levels = c(.25, .5, .75, .95)) {
+  colors <- c("blue", "red", "green", "purple","black","yellow")  # Colors for each cluster
+  plot(x[, feature_indices], pch = 19, col = "gray", xlab = names(x)[feature_indices[1]], ylab = names(x)[feature_indices[2]])
+  
+  for (k in 1:t) {
+    cluster_points <- x[cluster_assignments == k, feature_indices]
+    points(cluster_points, pch = 19, col = colors[k])
+    
+    mu <- em$mu[[k]][feature_indices]
+    sigma <- em$sigma[[k]][feature_indices, feature_indices]
+    
+    for (alpha in alpha_levels) {
+      lines(ellipse(mu, sigma, alpha), col = colors[k])
+    }
+  }
+  
+  legend("topright", legend = 1:t, col = colors, pch = 19, title = "Clusters")
+}
+
+
+# Key Features (AnnualRainfall & ForestAreaPercentage) in PC2
+features <- data[, c( 'AnnualRainfall', 'ForestAreaPercentage')]
+
+# Generate plots for each pair of features
+# Here only for AirQualityIndex v.s. AverageTemperature as we only used two features
+for (i in 1:(length(features) - 1)) {
+  for (j in (i + 1):length(features)) {
+    feature_indices <- c(i, j)
+    plot_em(features_scaled, em_result$params, feature_indices, cluster_assignments, t_range)
+  }
+}
+```
